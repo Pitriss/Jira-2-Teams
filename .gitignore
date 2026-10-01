@@ -1,0 +1,13 @@
+/target/
+/dist/
+*.deb
+*.patch
+*.rej
+*.orig
+*.bak
+*~
+.env
+jira2teams.env
+teams-auth.json
+state.json
+src/main.rs.before-*

@@ -1,0 +1,16 @@
+jira2teams for Debian
+---------------------
+
+The package installs a static binary to /usr/bin/jira2teams and a systemd user
+unit to /usr/lib/systemd/user/jira2teams.service.
+
+Per-user Jira credentials and Teams tokens are intentionally not packaged.
+Create ~/.config/jira2teams/jira2teams.env, run `jira2teams --login` once, then
+enable the user service with:
+
+  systemctl --user enable --now jira2teams.service
+
+For boot-time operation without an interactive desktop login, enable linger for
+the service account:
+
+  sudo loginctl enable-linger "$USER"

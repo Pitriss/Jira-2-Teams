@@ -1,0 +1,16 @@
+[Unit]
+Description=Jira2Teams Jira watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/jira2teams/jira2teams.env
+ExecStart=%h/.local/bin/jira2teams
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
