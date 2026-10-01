@@ -36,13 +36,33 @@ TEAMS_WEBHOOK_URL=<Teams Workflow callback URL>
 
 If `TEAMS_WEBHOOK_URL` is set and `TEAMS_TRANSPORT` is omitted, Jira2Teams automatically selects the webhook transport.
 
-The webhook receives:
+The webhook receives a versioned structured JSON payload. The `text` field remains available as a compatibility fallback:
 
 ```json
 {
-  "text": "Jira notification text"
+  "schema_version": 1,
+  "event": "status_changed",
+  "key": "EX-123",
+  "summary": "Example issue",
+  "status": "In Progress",
+  "old_status": "Open",
+  "assignee": "Example User",
+  "old_assignee": null,
+  "resolution": null,
+  "url": "https://example.atlassian.net/browse/EX-123",
+  "text": "EX-123: Open -> In Progress\nExample issue\nhttps://example.atlassian.net/browse/EX-123"
 }
 ```
+
+For an issue that newly enters the tracked JQL after being assigned to the current Jira user, v0.5.1 queries the Jira issue changelog on a best-effort basis. When the latest matching assignment change is available, `old_assignee` contains the previous assignee. If a status transition happened in that same changelog entry, `old_status` is populated as well.
+
+A Power Automate **Post message in a chat or channel** action can use the structured fields directly. A message expression that remains compatible with v0.5.0 is:
+
+```text
+if(empty(triggerBody()?['key']),replace(coalesce(triggerBody()?['text'],''),decodeUriComponent('%0A'),'<br>'),concat('<b>',triggerBody()?['key'],if(empty(triggerBody()?['summary']),'',concat(' — ',triggerBody()?['summary'])),'</b><br>',if(and(not(empty(triggerBody()?['old_assignee'])),not(empty(triggerBody()?['assignee'])),not(equals(triggerBody()?['old_assignee'],triggerBody()?['assignee']))),concat('Assignment: ',triggerBody()?['old_assignee'],' → ',triggerBody()?['assignee'],'<br>'),if(not(empty(triggerBody()?['assignee'])),concat('Assignee: ',triggerBody()?['assignee'],'<br>'),'')),if(and(not(empty(triggerBody()?['old_status'])),not(empty(triggerBody()?['status'])),not(equals(triggerBody()?['old_status'],triggerBody()?['status']))),concat('Status: ',triggerBody()?['old_status'],' → ',triggerBody()?['status'],'<br>'),if(not(empty(triggerBody()?['status'])),concat('Status: ',triggerBody()?['status'],'<br>'),'')),if(not(empty(triggerBody()?['url'])),concat('<a href="',triggerBody()?['url'],'">Open in Jira</a>'),'')))
+```
+
+`jira2teams --test-teams` sends a synthetic structured webhook payload in webhook mode so this mapping can be tested without changing a real Jira issue.
 
 The v0.5.0 implementation is intended for a Workflow trigger whose authentication setting is **Anyone**. Jira2Teams deliberately sends no `Authorization` header in this mode. Treat `TEAMS_WEBHOOK_URL` as a credential and keep the environment file at mode `0600`.
 

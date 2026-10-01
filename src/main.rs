@@ -102,17 +102,63 @@ fn teams_transport_from_env() -> Result<TeamsTransport> {
     parse_teams_transport(configured.as_deref(), webhook_url_present)
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct TeamsWebhookPayload {
+    schema_version: u32,
+    event: String,
+    key: Option<String>,
+    summary: Option<String>,
+    status: Option<String>,
+    old_status: Option<String>,
+    assignee: Option<String>,
+    old_assignee: Option<String>,
+    resolution: Option<String>,
+    url: Option<String>,
+    text: String,
+}
+
+impl TeamsWebhookPayload {
+    fn text_only(text: String) -> Self {
+        Self {
+            schema_version: 1,
+            event: "message".to_string(),
+            key: None,
+            summary: None,
+            status: None,
+            old_status: None,
+            assignee: None,
+            old_assignee: None,
+            resolution: None,
+            url: None,
+            text,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TeamsMessage {
     html: String,
-    text: String,
+    webhook: TeamsWebhookPayload,
 }
 
 impl TeamsMessage {
     fn new(html: impl Into<String>, text: impl Into<String>) -> Self {
+        let text = text.into();
         Self {
             html: html.into(),
-            text: text.into(),
+            webhook: TeamsWebhookPayload::text_only(text),
+        }
+    }
+
+    fn with_webhook(
+        html: impl Into<String>,
+        text: impl Into<String>,
+        mut webhook: TeamsWebhookPayload,
+    ) -> Self {
+        webhook.text = text.into();
+        Self {
+            html: html.into(),
+            webhook,
         }
     }
 }
@@ -267,6 +313,41 @@ struct JiraResolution {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct JiraChangelogPage {
+    #[serde(default)]
+    values: Vec<JiraChangelogHistory>,
+    #[serde(default, rename = "isLast")]
+    is_last: Option<bool>,
+    #[serde(default, rename = "startAt")]
+    start_at: u32,
+    #[serde(default)]
+    total: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct JiraChangelogHistory {
+    #[serde(default)]
+    items: Vec<JiraChangelogItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JiraChangelogItem {
+    field: String,
+    #[serde(default, rename = "fieldId")]
+    field_id: Option<String>,
+    #[serde(default, rename = "fromString")]
+    from_string: Option<String>,
+    #[serde(default, rename = "toString")]
+    to_string: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct JiraEntryContext {
+    old_assignee: Option<String>,
+    old_status: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct JiraIssueState {
     updated: String,
@@ -314,10 +395,9 @@ impl TeamsWebhookClient {
         Ok(Self { http, webhook_url })
     }
 
-    fn send_text(&self, text: &str) -> Result<()> {
-        let payload = json!({ "text": text });
+    fn send_payload(&self, payload: &TeamsWebhookPayload) -> Result<()> {
         let serialized =
-            serde_json::to_vec(&payload).context("Cannot serialize Teams webhook payload")?;
+            serde_json::to_vec(payload).context("Cannot serialize Teams webhook payload")?;
         if serialized.len() > MAX_TEAMS_WEBHOOK_BYTES {
             bail!(
                 "Teams webhook payload is {} bytes; limit is {} bytes",
@@ -332,7 +412,7 @@ impl TeamsWebhookClient {
                 .http
                 .post(&self.webhook_url)
                 .header("Accept", "application/json")
-                .json(&payload)
+                .json(payload)
                 .send();
 
             match response {
@@ -400,7 +480,7 @@ impl TeamsSender {
     fn send_message(&mut self, message: &TeamsMessage) -> Result<()> {
         match self {
             Self::Consumer(client) => client.send_html(&message.html),
-            Self::Webhook(client) => client.send_text(&message.text),
+            Self::Webhook(client) => client.send_payload(&message.webhook),
         }
     }
 
@@ -1124,10 +1204,32 @@ fn main() -> Result<()> {
         Mode::TestTeams => {
             let mut teams = TeamsSender::from_env(true)?;
             teams.ensure_ready()?;
-            teams.send_message(&TeamsMessage::new(
-                "<b>jira2teams</b><br>Test Teams message.",
-                "jira2teams\nTest Teams message.",
-            ))?;
+
+            let message = match &teams {
+                TeamsSender::Webhook(_) => TeamsMessage::with_webhook(
+                    "<b>J2T-TEST: Open -&gt; In Progress</b><br>Structured webhook test.",
+                    "J2T-TEST: Open -> In Progress\nStructured webhook test.\nhttps://example.invalid/browse/J2T-TEST",
+                    TeamsWebhookPayload {
+                        schema_version: 1,
+                        event: "assigned".to_string(),
+                        key: Some("J2T-TEST".to_string()),
+                        summary: Some("Structured webhook test".to_string()),
+                        status: Some("In Progress".to_string()),
+                        old_status: Some("Open".to_string()),
+                        assignee: Some("Current User".to_string()),
+                        old_assignee: Some("Previous User".to_string()),
+                        resolution: None,
+                        url: Some("https://example.invalid/browse/J2T-TEST".to_string()),
+                        text: String::new(),
+                    },
+                ),
+                TeamsSender::Consumer(_) => TeamsMessage::new(
+                    "<b>jira2teams</b><br>Test Teams message.",
+                    "jira2teams\nTest Teams message.",
+                ),
+            };
+
+            teams.send_message(&message)?;
             println!("Test Teams message sent via {} transport.", teams.name());
             return Ok(());
         }
@@ -1189,12 +1291,16 @@ fn check_once(
         for issue in &issues {
             match old_state.get(&issue.key) {
                 None => {
+                    let entry_context = match fetch_jira_entry_context(cfg, jira_http, issue) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            eprintln!("Jira changelog enrichment {} failed: {error:#}. Continuing without history.", issue.key);
+                            JiraEntryContext::default()
+                        }
+                    };
                     notifications.push((
                         issue.key.clone(),
-                        TeamsMessage::new(
-                            format_current_jira_message(issue, None),
-                            format_current_jira_text(cfg, issue, None),
-                        ),
+                        current_jira_teams_message(cfg, issue, None, Some(&entry_context)),
                         format!("novy tiket: {}", issue.fields.summary),
                     ));
                     changed_count += 1;
@@ -1202,10 +1308,7 @@ fn check_once(
                 Some(old) if old.updated != issue.fields.updated => {
                     notifications.push((
                         issue.key.clone(),
-                        TeamsMessage::new(
-                            format_current_jira_message(issue, Some(old)),
-                            format_current_jira_text(cfg, issue, Some(old)),
-                        ),
+                        current_jira_teams_message(cfg, issue, Some(old), None),
                         format!("zmena: {}", issue.fields.summary),
                     ));
                     changed_count += 1;
@@ -1223,10 +1326,7 @@ fn check_once(
                 .with_context(|| format!("Nelze overit tiket {key}, ktery zmizel z JQL"))?;
             notifications.push((
                 key.clone(),
-                TeamsMessage::new(
-                    format_missing_jira_message(key, old, current.as_ref()),
-                    format_missing_jira_text(cfg, key, old, current.as_ref()),
-                ),
+                missing_jira_teams_message(cfg, key, old, current.as_ref()),
                 "tiket opustil sledovane JQL".to_string(),
             ));
             missing_count += 1;
@@ -1250,6 +1350,115 @@ fn check_once(
         missing_count
     );
     Ok(())
+}
+
+fn changelog_field_matches(item: &JiraChangelogItem, field: &str) -> bool {
+    item.field.eq_ignore_ascii_case(field)
+        || item
+            .field_id
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(field))
+            .unwrap_or(false)
+}
+
+fn clean_changelog_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn update_entry_context_from_history(
+    context: &mut JiraEntryContext,
+    history: &JiraChangelogHistory,
+    current_assignee: Option<&str>,
+    current_status: &str,
+) {
+    let Some(assignee_change) = history.items.iter().find(|item| {
+        if !changelog_field_matches(item, "assignee") {
+            return false;
+        }
+        let target = clean_changelog_value(item.to_string.as_deref());
+        target.as_deref() == current_assignee
+    }) else {
+        return;
+    };
+
+    context.old_assignee = Some(
+        clean_changelog_value(assignee_change.from_string.as_deref())
+            .unwrap_or_else(|| "Unassigned".to_string()),
+    );
+    context.old_status = history
+        .items
+        .iter()
+        .find(|item| {
+            changelog_field_matches(item, "status")
+                && clean_changelog_value(item.to_string.as_deref()).as_deref()
+                    == Some(current_status)
+        })
+        .and_then(|item| clean_changelog_value(item.from_string.as_deref()));
+}
+
+fn fetch_jira_entry_context(
+    cfg: &AppConfig,
+    http: &Client,
+    issue: &JiraIssue,
+) -> Result<JiraEntryContext> {
+    let url = format!(
+        "{}/rest/api/3/issue/{}/changelog",
+        cfg.jira_url,
+        encode(&issue.key)
+    );
+    let current_assignee = issue
+        .fields
+        .assignee
+        .as_ref()
+        .map(|assignee| assignee.display_name.as_str());
+    let current_status = issue.fields.status.name.as_str();
+    let mut start_at = 0_u32;
+    let mut context = JiraEntryContext::default();
+
+    loop {
+        let start_at_value = start_at.to_string();
+        let response = http
+            .get(&url)
+            .basic_auth(&cfg.jira_email, Some(&cfg.jira_api_token))
+            .header("Accept", "application/json")
+            .query(&[("startAt", start_at_value.as_str()), ("maxResults", "100")])
+            .send()
+            .with_context(|| format!("Jira changelog request for {} failed", issue.key))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .with_context(|| format!("Cannot read Jira changelog for {}", issue.key))?;
+        if !status.is_success() {
+            bail!(
+                "Jira changelog {} returned HTTP {}: {}",
+                issue.key,
+                status,
+                truncate(&body, 900)
+            );
+        }
+        let page: JiraChangelogPage = serde_json::from_str(&body)
+            .with_context(|| format!("Jira changelog {} returned unexpected JSON", issue.key))?;
+        let page_count = page.values.len() as u32;
+        for history in &page.values {
+            update_entry_context_from_history(
+                &mut context,
+                history,
+                current_assignee,
+                current_status,
+            );
+        }
+        if page.is_last == Some(true)
+            || page_count == 0
+            || page.start_at.saturating_add(page_count) >= page.total
+        {
+            break;
+        }
+        start_at = page.start_at.saturating_add(page_count);
+    }
+    Ok(context)
 }
 
 fn fetch_jira_issues(cfg: &AppConfig, http: &Client) -> Result<Vec<JiraIssue>> {
@@ -1373,6 +1582,121 @@ fn jira_issue_state(issue: &JiraIssue) -> JiraIssueState {
             .as_ref()
             .map(|resolution| resolution.name.clone()),
     }
+}
+
+fn current_jira_teams_message(
+    cfg: &AppConfig,
+    issue: &JiraIssue,
+    old: Option<&JiraIssueState>,
+    entry_context: Option<&JiraEntryContext>,
+) -> TeamsMessage {
+    let state = jira_issue_state(issue);
+    let old_status = match old {
+        Some(old) if old.status != state.status => Some(old.status.clone()),
+        Some(_) => None,
+        None => entry_context.and_then(|context| context.old_status.clone()),
+    };
+    let old_assignee = match old {
+        Some(old) if old.assignee != state.assignee => Some(
+            old.assignee
+                .clone()
+                .unwrap_or_else(|| "Unassigned".to_string()),
+        ),
+        Some(_) => None,
+        None => entry_context.and_then(|context| context.old_assignee.clone()),
+    };
+    let event = if old.is_none() && old_assignee.is_some() {
+        "assigned"
+    } else if old_status.is_some() {
+        "status_changed"
+    } else if old_assignee.is_some() {
+        "assignee_changed"
+    } else if old.is_none() {
+        "new"
+    } else {
+        "changed"
+    };
+    let payload = TeamsWebhookPayload {
+        schema_version: 1,
+        event: event.to_string(),
+        key: Some(issue.key.clone()),
+        summary: Some(state.summary.clone()),
+        status: Some(state.status.clone()),
+        old_status,
+        assignee: state.assignee.clone(),
+        old_assignee,
+        resolution: state.resolution.clone(),
+        url: Some(format!("{}/browse/{}", cfg.jira_url, issue.key)),
+        text: String::new(),
+    };
+    TeamsMessage::with_webhook(
+        format_current_jira_message(issue, old),
+        format_current_jira_text(cfg, issue, old),
+        payload,
+    )
+}
+
+fn missing_jira_teams_message(
+    cfg: &AppConfig,
+    key: &str,
+    old: &JiraIssueState,
+    current: Option<&JiraIssue>,
+) -> TeamsMessage {
+    let url = format!("{}/browse/{key}", cfg.jira_url);
+    let html = format_missing_jira_message(key, old, current);
+    let text = format_missing_jira_text(cfg, key, old, current);
+    let payload = if let Some(current) = current {
+        let state = jira_issue_state(current);
+        let old_status = if old.status != state.status {
+            Some(old.status.clone())
+        } else {
+            None
+        };
+        let old_assignee = if old.assignee != state.assignee {
+            Some(
+                old.assignee
+                    .clone()
+                    .unwrap_or_else(|| "Unassigned".to_string()),
+            )
+        } else {
+            None
+        };
+        let event = if state.resolution.is_some() && old.resolution.is_none() {
+            "resolved"
+        } else if old_assignee.is_some() {
+            "reassigned"
+        } else {
+            "left_jql"
+        };
+        TeamsWebhookPayload {
+            schema_version: 1,
+            event: event.to_string(),
+            key: Some(key.to_string()),
+            summary: Some(state.summary.clone()),
+            status: Some(state.status.clone()),
+            old_status,
+            assignee: state.assignee.clone(),
+            old_assignee,
+            resolution: state.resolution.clone(),
+            url: Some(url),
+            text: String::new(),
+        }
+    } else {
+        TeamsWebhookPayload {
+            schema_version: 1,
+            event: "inaccessible".to_string(),
+            key: Some(key.to_string()),
+            summary: Some(old.summary.clone()),
+            status: Some(old.status.clone()),
+            old_status: None,
+            assignee: old.assignee.clone(),
+            old_assignee: None,
+            resolution: old.resolution.clone(),
+            url: Some(url),
+            text: String::new(),
+        }
+    };
+    TeamsMessage::with_webhook(html, text, payload)
 }
 
 fn format_current_jira_message(issue: &JiraIssue, old: Option<&JiraIssueState>) -> String {
@@ -1913,6 +2237,130 @@ mod tests {
         assert!(html.contains("vyreseno"));
         assert!(html.contains("Hotovo"));
         assert!(html.contains("Done"));
+    }
+
+    #[test]
+    fn entry_context_extracts_assignment_and_same_history_status() {
+        let history = JiraChangelogHistory {
+            items: vec![
+                JiraChangelogItem {
+                    field: "assignee".to_string(),
+                    field_id: Some("assignee".to_string()),
+                    from_string: Some("Alice".to_string()),
+                    to_string: Some("Petr".to_string()),
+                },
+                JiraChangelogItem {
+                    field: "status".to_string(),
+                    field_id: Some("status".to_string()),
+                    from_string: Some("Open".to_string()),
+                    to_string: Some("Assigned".to_string()),
+                },
+            ],
+        };
+        let mut context = JiraEntryContext::default();
+        update_entry_context_from_history(&mut context, &history, Some("Petr"), "Assigned");
+        assert_eq!(context.old_assignee.as_deref(), Some("Alice"));
+        assert_eq!(context.old_status.as_deref(), Some("Open"));
+    }
+
+    #[test]
+    fn entry_context_uses_latest_assignment_to_current_user() {
+        let first = JiraChangelogHistory {
+            items: vec![JiraChangelogItem {
+                field: "assignee".to_string(),
+                field_id: Some("assignee".to_string()),
+                from_string: Some("Alice".to_string()),
+                to_string: Some("Petr".to_string()),
+            }],
+        };
+        let second = JiraChangelogHistory {
+            items: vec![JiraChangelogItem {
+                field: "assignee".to_string(),
+                field_id: Some("assignee".to_string()),
+                from_string: Some("Bob".to_string()),
+                to_string: Some("Petr".to_string()),
+            }],
+        };
+
+        let mut context = JiraEntryContext::default();
+        update_entry_context_from_history(&mut context, &first, Some("Petr"), "Assigned");
+        update_entry_context_from_history(&mut context, &second, Some("Petr"), "Assigned");
+
+        assert_eq!(context.old_assignee.as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn entry_context_marks_previous_unassigned_state() {
+        let history = JiraChangelogHistory {
+            items: vec![JiraChangelogItem {
+                field: "assignee".to_string(),
+                field_id: Some("assignee".to_string()),
+                from_string: None,
+                to_string: Some("Petr".to_string()),
+            }],
+        };
+        let mut context = JiraEntryContext::default();
+        update_entry_context_from_history(&mut context, &history, Some("Petr"), "Assigned");
+        assert_eq!(context.old_assignee.as_deref(), Some("Unassigned"));
+        assert_eq!(context.old_status, None);
+    }
+
+    #[test]
+    fn structured_webhook_payload_reports_status_change() {
+        let cfg = AppConfig {
+            jira_url: "https://example.atlassian.net".to_string(),
+            jira_email: "user@example.com".to_string(),
+            jira_api_token: "token".to_string(),
+            jql: DEFAULT_JQL.to_string(),
+            poll_interval: 60,
+            state_file: PathBuf::from("/tmp/jira2teams-test-state.json"),
+            max_results: 50,
+        };
+        let old = JiraIssueState {
+            updated: "old".to_string(),
+            summary: "Summary".to_string(),
+            status: "Open".to_string(),
+            assignee: Some("Petr".to_string()),
+            resolution: None,
+        };
+        let issue = JiraIssue {
+            key: "K2HW-1".to_string(),
+            fields: JiraFields {
+                summary: "Summary".to_string(),
+                status: JiraStatus {
+                    name: "In Progress".to_string(),
+                },
+                updated: "new".to_string(),
+                assignee: Some(JiraAssignee {
+                    display_name: "Petr".to_string(),
+                }),
+                resolution: None,
+            },
+        };
+        let message = current_jira_teams_message(&cfg, &issue, Some(&old), None);
+        assert_eq!(message.webhook.schema_version, 1);
+        assert_eq!(message.webhook.event, "status_changed");
+        assert_eq!(message.webhook.key.as_deref(), Some("K2HW-1"));
+        assert_eq!(message.webhook.old_status.as_deref(), Some("Open"));
+        assert_eq!(message.webhook.status.as_deref(), Some("In Progress"));
+        assert_eq!(
+            message.webhook.url.as_deref(),
+            Some("https://example.atlassian.net/browse/K2HW-1")
+        );
+        assert!(message.webhook.text.contains("K2HW-1: Open -> In Progress"));
+    }
+
+    #[test]
+    fn text_only_webhook_payload_keeps_v050_fallback() {
+        let message = TeamsMessage::new(
+            "<b>jira2teams</b><br>Test Teams message.",
+            "jira2teams\nTest Teams message.",
+        );
+        let value = serde_json::to_value(&message.webhook).expect("serialize payload");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["event"], "message");
+        assert!(value["key"].is_null());
+        assert_eq!(value["text"], "jira2teams\nTest Teams message.");
     }
 
     #[test]

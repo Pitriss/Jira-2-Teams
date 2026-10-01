@@ -51,3 +51,11 @@ TEAMS_THREAD_ID='19:...@thread.v2' bash scripts/diagnostics/e2e-test.sh
 ```
 
 Never put production credentials into committed fixtures or test data.
+
+## Structured webhook payload
+
+For v0.5.1, verify that webhook messages keep the compatibility `text` field and also expose structured fields such as `key`, `summary`, `status`, `old_status`, `assignee`, `old_assignee`, and `url`.
+
+When a newly tracked issue was assigned to the current Jira user, test that Jira changelog enrichment reports the previous assignee. Changelog lookup is best-effort: a history API failure must not suppress the notification itself.
+
+The webhook-mode `--test-teams` command sends a synthetic structured event with `old_assignee`, `assignee`, `old_status`, `status`, and `url`. Use it to validate the Power Automate field mapping without modifying a real Jira issue.

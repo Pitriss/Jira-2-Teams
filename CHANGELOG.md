@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 - 2026-10-01
+
+- send a structured versioned JSON payload to the Teams Workflow webhook while retaining the legacy `text` field,
+- expose `event`, `key`, `summary`, `status`, `old_status`, `assignee`, `old_assignee`, `resolution`, and `url`,
+- enrich newly tracked issues with Jira changelog data so assignment notifications can show the previous assignee,
+- include a simultaneous status transition when it is part of the same Jira changelog entry as the assignment,
+- keep changelog enrichment best-effort so Jira notifications still send when history retrieval fails,
+- add regression tests for structured payloads and Jira changelog assignment extraction.
+- make webhook-mode `--test-teams` send a synthetic structured event so Workflow mappings can be validated without modifying Jira.
+
 ## 0.5.0 - 2026-10-01
 
 - add a transport abstraction for Teams message delivery,
