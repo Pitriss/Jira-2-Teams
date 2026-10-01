@@ -1,28 +1,41 @@
 # Jira2Teams
 
-`jira2teams` je malý staticky linkovaný Rust daemon pro Linux, který periodicky sleduje Jira Cloud a při změně tiketu pošle 1:1 zprávu do Microsoft Teams Personal.
+Jira2Teams is a small statically linked Rust daemon for Linux. It polls Jira Cloud and sends one-to-one notifications to Microsoft Teams when a tracked Jira issue changes.
 
-Projekt vznikl jako náhrada Bash skriptu používajícího `curl`, `jq` a `notify-send`. Výsledná binárka nepotřebuje tyto runtime nástroje a je sestavená jako statický `musl` executable.
+The project started as a replacement for a Bash watcher built around `curl`, `jq`, and `notify-send`. The production binary is built as a static `musl` executable and does not require those tools at runtime.
 
-## Co umí
+## Features
 
-- poll Jira Cloud přes REST API,
-- vlastní JQL dotaz,
-- detekovat změnu podle Jira `updated`,
-- uchovávat stav mezi restarty,
-- posílat zprávy do existujícího Teams Personal 1:1 chatu,
-- jednorázový device-code login a následné použití uloženého refresh tokenu,
-- běžet jako `systemd --user` služba,
-- statický `x86_64-unknown-linux-musl` build,
-- vytvořit `.deb` balíček pro Debian 13/amd64.
+- Jira Cloud polling through the REST API
+- configurable JQL
+- persistent state across restarts
+- detection of new and changed issues
+- detection of issues that leave the tracked JQL result
+- classification of resolved and reassigned issues when Jira detail remains accessible
+- automatic migration of the legacy v0.3.x state format
+- Microsoft Teams Personal one-to-one notifications
+- device-code login with a persisted refresh-token cache
+- `systemd --user` deployment
+- static `x86_64-unknown-linux-musl` build
+- Debian 13/amd64 package generation
+- unit tests, diagnostics, and end-to-end test tooling
 
-## Důležité omezení Teams
+## Current Teams transport
 
-Odesílání zpráv nepoužívá Microsoft Graph. Teams Personal chat používá neveřejný consumer backend Microsoftu. Tento backend není veřejné stabilní API a Microsoft jej může změnit bez upozornění.
+The current Teams Personal transport does **not** use Microsoft Graph for message delivery. It uses Microsoft's consumer chat backend.
 
-Některé nové osobní účty mohou být dočasně v Teams `quarantine mode`. V tomto režimu Microsoft odmítá zprávy obsahující URL (`QuarantineURLsBlocked`). Jira2Teams proto posílá notifikace bez klikatelného Jira URL a URL v textu notifikace filtruje.
+This backend is not a public or stable API. Microsoft can change or restrict it without notice. Accounts can also be placed into anti-abuse or quarantine states. One observed restriction is:
 
-## Tok dat
+```text
+QuarantineURLsBlocked
+URLs are not allowed in messages in quarantine mode
+```
+
+Jira2Teams therefore strips URLs from notification text before sending through the consumer transport.
+
+For production environments, read [docs/TEAMS-CONSUMER-RISK.md](docs/TEAMS-CONSUMER-RISK.md). A supported Teams Workflows webhook transport is the preferred future direction.
+
+## Data flow
 
 ```text
 Jira Cloud
@@ -31,24 +44,52 @@ Jira Cloud
     v
 jira2teams
     |
-    | porovnání key -> updated
+    | compare current Jira state with persisted state
     v
 state.json
     |
-    | Teams Personal consumer auth/chat
+    | Teams Personal consumer chat transport
     v
 1:1 Teams chat
 ```
 
-## Build na Debianu 13
+## Jira state model
 
-Nainstaluj nástroje:
+Since v0.4.0, Jira2Teams stores richer per-issue state:
+
+```json
+{
+  "K2HW-7127": {
+    "updated": "2026-09-30T15:02:27.712+0200",
+    "summary": "Example issue",
+    "status": "Assigned",
+    "assignee": "Example User",
+    "resolution": null
+  }
+}
+```
+
+The v0.3.x format:
+
+```json
+{
+  "K2HW-7127": "2026-09-30T15:02:27.712+0200"
+}
+```
+
+is accepted and migrated automatically on the next successful poll.
+
+Jira enhanced JQL search is fully paginated with `nextPageToken` before state comparison. This prevents issues on later result pages from being incorrectly classified as missing.
+
+## Build on Debian 13
+
+Install build dependencies:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y build-essential musl-dev musl-tools pkg-config dpkg-dev ca-certificates
 ```
 
-Rust target:
+Install the Rust target:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
@@ -60,95 +101,97 @@ Build:
 ./deploy.sh build
 ```
 
-Výsledná binárka:
+The resulting binary is:
 
 ```text
 target/x86_64-unknown-linux-musl/release/jira2teams
 ```
 
-Kontrola:
+Verify static linking:
 
 ```bash
 file target/x86_64-unknown-linux-musl/release/jira2teams
 ldd target/x86_64-unknown-linux-musl/release/jira2teams
 ```
 
-Očekávaný výsledek je `static-pie linked` / `statically linked`.
+Expected output includes `static-pie linked` / `statically linked`.
 
-## První Teams přihlášení
+## First Teams login
 
-Spusť:
+Run:
 
 ```bash
 ./target/x86_64-unknown-linux-musl/release/jira2teams --login
 ```
 
-Aplikace zobrazí Microsoft device-code URL a kód. Po úspěšném přihlášení uloží token cache do:
+Jira2Teams displays the Microsoft device-code login URL and code. After successful login, the refresh-token cache is stored in:
 
 ```text
 ~/.config/jira2teams/teams-auth.json
 ```
 
-Soubor má mít práva `0600`.
+The file should have mode `0600`.
 
-Login přežívá restart aplikace i počítače. Pokud Microsoft refresh token zneplatní, je potřeba `--login` zopakovat.
+The cached login normally survives both application and host restarts. If Microsoft revokes the refresh token, run `--login` again.
 
-Seznam dostupných chatů:
+List available chats:
 
 ```bash
 ./target/x86_64-unknown-linux-musl/release/jira2teams --list-chats
 ```
 
-## Konfigurace Jira a Teams
+## Configuration
 
-Vzor je v `jira2teams.env.example`.
+The example configuration is `jira2teams.env.example`.
 
-Pro `systemd --user` použij:
+For `systemd --user`, use:
 
 ```text
 ~/.config/jira2teams/jira2teams.env
 ```
 
-Nejdůležitější proměnné:
+Important variables:
 
 ```text
-JIRA_URL=https://firma.atlassian.net
+JIRA_URL=https://company.atlassian.net
 JIRA_EMAIL=user@example.com
 JIRA_API_TOKEN=...
-TEAMS_THREAD_ID=19:...@thread.v2
+JQL=assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC
 POLL_INTERVAL=60
 MAX_RESULTS=50
+TEAMS_THREAD_ID=19:...@thread.v2
 ```
 
-Výchozí JQL:
+Optional runtime paths:
 
 ```text
-assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC
+STATE_FILE=~/.cache/jira2teams/state.json
+TEAMS_AUTH_FILE=~/.config/jira2teams/teams-auth.json
 ```
 
-Pozor: tiket, který přestane odpovídat JQL, zmizí z aktuální množiny. Tohle je známé omezení současné detekční logiky a je vhodné ho před další stabilní verzí rozšířit o detekci tiketů, které ze sledované množiny zmizely.
+## One-shot tests
 
-## Jednorázový test
+Send a direct Teams test message:
 
 ```bash
 TEAMS_THREAD_ID='19:...@thread.v2' ./target/x86_64-unknown-linux-musl/release/jira2teams --test-teams
 ```
 
-Jedna kontrola Jira:
+Run one Jira poll:
 
 ```bash
 ./target/x86_64-unknown-linux-musl/release/jira2teams --once
 ```
 
-## Deploy jako background služba
+## Background deployment
 
-Instalace pro aktuálního uživatele:
+Install for the current user:
 
 ```bash
 ./deploy.sh install-user
 ```
 
-Instaluje:
+Local deployment installs:
 
 ```text
 ~/.local/bin/jira2teams
@@ -157,65 +200,57 @@ Instaluje:
 ~/.cache/jira2teams/
 ```
 
-Při přechodu ze starého `jira-watch` se existující Teams token a Jira state automaticky zkopírují do nového namespace, pokud cílové soubory ještě neexistují.
-
-Stav služby:
+Service status:
 
 ```bash
 systemctl --user status jira2teams.service
 ```
 
-Log:
+Follow logs:
 
 ```bash
 journalctl --user -u jira2teams.service -f
 ```
 
-Restart po nasazení nové binárky:
-
-```bash
-./deploy.sh restart-user
-```
-
-Aby user service běžela i po rebootu bez přihlášení do KDE:
+Enable the user manager at boot even without an interactive KDE login:
 
 ```bash
 sudo loginctl enable-linger "$USER"
 ```
 
-Kontrola:
+Verify:
 
 ```bash
 loginctl show-user "$USER" -p Linger
 ```
 
-## Debian 13 balíček
+## Debian 13 package
 
-Sestavení:
+Build:
 
 ```bash
 ./deploy.sh package-deb
 ```
 
-Výstup:
+Output:
 
 ```text
-dist/jira2teams_<verze>_amd64.deb
+dist/jira2teams_<version>_amd64.deb
 ```
 
-Kontrola obsahu:
+Inspect:
 
 ```bash
 dpkg-deb -c dist/jira2teams_*_amd64.deb
 ```
 
-Instalace:
+Install:
 
 ```bash
 sudo dpkg -i dist/jira2teams_*_amd64.deb
 ```
 
-Balíček instaluje:
+The package installs:
 
 ```text
 /usr/bin/jira2teams
@@ -223,65 +258,51 @@ Balíček instaluje:
 /usr/share/doc/jira2teams/
 ```
 
-Debian unit používá `/usr/bin/jira2teams`; lokální `./deploy.sh install-user`
-používá `~/.local/bin/jira2teams`.
+The Debian package intentionally does not contain Jira credentials, Teams tokens, or runtime state.
 
-Konfiguraci a Teams token záměrně nevkládá do `.deb`; jde o uživatelská tajemství.
+## Diagnostics
 
-## Diagnostika
-
-Gather:
+Gather Jira/state information:
 
 ```bash
 bash scripts/diagnostics/gather.sh
 ```
 
-End-to-end test:
+Run the real Jira-to-Teams end-to-end test:
 
 ```bash
 TEAMS_THREAD_ID='19:...@thread.v2' bash scripts/diagnostics/e2e-test.sh
 ```
 
-Podrobnosti jsou v `docs/TROUBLESHOOTING.md`.
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
-## Bezpečnost
+## Validation
 
-- `JIRA_API_TOKEN` ukládej pouze do souboru s právy `0600`.
-- `teams-auth.json` obsahuje dlouhodobý refresh token a musí mít `0600`.
-- Tokeny nikdy necommituj.
-- `.gitignore` záměrně ignoruje lokální env/token/state soubory.
-
-## Upgrade
-
-Po `git pull`:
-
-```bash
-./deploy.sh build
-./deploy.sh install-user
-```
-
-Nebo jen:
-
-```bash
-./deploy.sh install-user
-```
-
-`install-user` vždy sestaví aktuální release binárku před instalací.
-
-## Vývoj
-
-Viz `docs/DEVELOPMENT.md`.
-
-## Testy a validace
-
-Před commitem nebo releasem spusť:
+Before a commit or release:
 
 ```bash
 bash scripts/validate.sh
 ```
 
-Skript kontroluje formátování, unit testy, `clippy` bez warningů, statický musl
-build, Debian balíček a Git whitespace. Podrobnosti jsou v
-`docs/TESTING.md`.
+The validation checks formatting, unit tests, Clippy with warnings denied, static musl build, Debian package generation, package contents, and Git whitespace.
 
-Bezpečnostní poznámky k Jira a Teams tokenům jsou v `SECURITY.md`.
+See [docs/TESTING.md](docs/TESTING.md).
+
+## Security
+
+Read [SECURITY.md](SECURITY.md) before deploying. In particular:
+
+- keep `JIRA_API_TOKEN` in a mode `0600` file,
+- protect `teams-auth.json` with mode `0600`,
+- never commit tokens or runtime state,
+- do not attempt to bypass Microsoft account restrictions by simulating human interaction.
+
+## Development
+
+See:
+
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- [docs/TESTING.md](docs/TESTING.md)
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- [docs/TEAMS-CONSUMER-RISK.md](docs/TEAMS-CONSUMER-RISK.md)

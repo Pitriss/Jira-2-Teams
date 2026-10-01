@@ -5,8 +5,16 @@ The package installs a static binary to /usr/bin/jira2teams and a systemd user
 unit to /usr/lib/systemd/user/jira2teams.service.
 
 Per-user Jira credentials and Teams tokens are intentionally not packaged.
-Create ~/.config/jira2teams/jira2teams.env, run `jira2teams --login` once, then
-enable the user service with:
+
+Create:
+
+  ~/.config/jira2teams/jira2teams.env
+
+Then authenticate Teams Personal if using the consumer transport:
+
+  jira2teams --login
+
+Enable the user service:
 
   systemctl --user enable --now jira2teams.service
 
@@ -14,3 +22,7 @@ For boot-time operation without an interactive desktop login, enable linger for
 the service account:
 
   sudo loginctl enable-linger "$USER"
+
+The Teams Personal consumer transport uses an unsupported Microsoft consumer
+backend. See /usr/share/doc/jira2teams/README.md and the project documentation
+for the associated operational risk.

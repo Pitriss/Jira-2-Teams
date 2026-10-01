@@ -13,33 +13,38 @@ The validation performs:
 3. `cargo clippy --release -- -D warnings`
 4. static `x86_64-unknown-linux-musl` release build
 5. Debian `amd64` package build
-6. inspection of the generated `.deb`
+6. inspection of generated `.deb` contents
 7. `git diff --check`
 
 ## Unit tests
 
-The initial regression tests cover behavior that already caused real integration
-problems during development:
+Regression tests cover behavior that has caused real integration failures or carries compatibility risk:
 
-- Microsoft device-code responses where `expires_in` and `interval` arrive as
-  either JSON numbers or numeric strings,
+- Microsoft device-code timing fields as JSON numbers or numeric strings,
 - the `verification_uri` compatibility alias,
-- stripping URLs from Teams notifications for accounts in quarantine mode,
+- URL stripping for Teams quarantine mode,
 - HTML escaping,
-- extraction of nested Teams/Skype tokens,
-- character-safe truncation of diagnostics.
+- nested Teams/Skype token extraction,
+- character-safe diagnostic truncation,
+- migration of the v0.3.x Jira state format,
+- rich-state round trips,
+- resolved-ticket classification,
+- reassignment classification.
 
 ## Integration diagnostics
 
-The scripts below use real configured services and therefore are not part of
-the automatic unit test suite:
+These scripts use real configured services and are therefore not part of the automatic unit test suite.
+
+Gather:
 
 ```bash
 bash scripts/diagnostics/gather.sh
 ```
 
+End-to-end Jira-to-Teams test:
+
 ```bash
 TEAMS_THREAD_ID='19:...@thread.v2' bash scripts/diagnostics/e2e-test.sh
 ```
 
-Never use production credentials in committed fixtures or test data.
+Never put production credentials into committed fixtures or test data.

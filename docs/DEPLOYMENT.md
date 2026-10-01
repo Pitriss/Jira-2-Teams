@@ -1,8 +1,8 @@
 # Deployment
 
-## User service
+## Runtime model
 
-Jira2Teams používá `systemd --user`. Proces zůstává ve foregroundu a lifecycle, restart a logování řeší systemd.
+Jira2Teams is designed to run in the foreground while `systemd --user` manages lifecycle, restart policy, and logging.
 
 ```bash
 ./deploy.sh install-user
@@ -10,13 +10,27 @@ systemctl --user status jira2teams.service
 journalctl --user -u jira2teams.service -f
 ```
 
-Pro běh po rebootu bez interaktivního loginu:
+To keep the user service available after reboot without an interactive desktop login:
 
 ```bash
 sudo loginctl enable-linger "$USER"
 ```
 
-## Runtime soubory
+Verify:
+
+```bash
+loginctl show-user "$USER" -p Linger
+```
+
+Expected result:
+
+```text
+Linger=yes
+```
+
+## Runtime files
+
+Local user deployment uses:
 
 ```text
 ~/.local/bin/jira2teams
@@ -25,18 +39,35 @@ sudo loginctl enable-linger "$USER"
 ~/.cache/jira2teams/state.json
 ```
 
-`jira2teams.env` a `teams-auth.json` mají být `0600`.
+Recommended permissions:
+
+```text
+~/.config/jira2teams/                 0700
+~/.config/jira2teams/jira2teams.env  0600
+~/.config/jira2teams/teams-auth.json 0600
+~/.cache/jira2teams/                  0700
+~/.cache/jira2teams/state.json        0600
+```
 
 ## Debian package
 
+Build:
+
 ```bash
 ./deploy.sh package-deb
+```
+
+Install:
+
+```bash
 sudo dpkg -i dist/jira2teams_*_amd64.deb
 ```
 
-Balíček neaktivuje user service automaticky, protože nemá rozhodovat, pod kterým uživatelem má Teams/Jira účet běžet.
+The package installs `/usr/bin/jira2teams` and a systemd user unit in `/usr/lib/systemd/user/jira2teams.service`.
 
-Po instalaci `.deb`:
+It deliberately does not enable the service automatically because credentials and the target Teams account belong to a specific unprivileged user.
+
+After package installation:
 
 ```bash
 mkdir -p ~/.config/jira2teams
@@ -45,3 +76,21 @@ chmod 600 ~/.config/jira2teams/jira2teams.env
 jira2teams --login
 systemctl --user enable --now jira2teams.service
 ```
+
+## Upgrade
+
+For a source checkout:
+
+```bash
+git pull --ff-only
+./deploy.sh install-user
+```
+
+For a Debian package:
+
+```bash
+sudo dpkg -i jira2teams_<version>_amd64.deb
+systemctl --user restart jira2teams.service
+```
+
+The state format from v0.3.x is migrated automatically by v0.4.0.

@@ -3,7 +3,7 @@ use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -190,6 +190,10 @@ struct JiraSearchResponse {
     #[serde(default, rename = "errorMessages")]
     error_messages: Vec<String>,
     message: Option<String>,
+    #[serde(default, rename = "isLast")]
+    is_last: Option<bool>,
+    #[serde(default, rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,11 +207,44 @@ struct JiraFields {
     summary: String,
     status: JiraStatus,
     updated: String,
+    #[serde(default)]
+    assignee: Option<JiraAssignee>,
+    #[serde(default)]
+    resolution: Option<JiraResolution>,
 }
 
 #[derive(Debug, Deserialize)]
 struct JiraStatus {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JiraAssignee {
+    #[serde(rename = "displayName")]
+    display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JiraResolution {
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JiraIssueState {
+    updated: String,
+    summary: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredIssueState {
+    Legacy(String),
+    Rich(JiraIssueState),
 }
 
 #[derive(Debug)]
@@ -970,74 +1007,253 @@ fn check_once(
     let issues = fetch_jira_issues(cfg, jira_http)?;
     let old_state = load_state(&cfg.state_file)?;
 
+    let new_state: HashMap<String, JiraIssueState> = issues
+        .iter()
+        .map(|issue| (issue.key.clone(), jira_issue_state(issue)))
+        .collect();
+
+    let mut notifications: Vec<(String, String, String)> = Vec::new();
+    let mut changed_count = 0_usize;
+    let mut missing_count = 0_usize;
+
     if !*first_run {
         for issue in &issues {
-            let changed = old_state
-                .get(&issue.key)
-                .map(|last| last != &issue.fields.updated)
-                .unwrap_or(true);
-            if changed {
-                let html = format_jira_message(cfg, issue);
-                teams
-                    .send_html(&html)
-                    .with_context(|| format!("Nelze odeslat Teams notifikaci pro {}", issue.key))?;
-                println!("Teams: {} - {}", issue.key, issue.fields.summary);
+            match old_state.get(&issue.key) {
+                None => {
+                    notifications.push((
+                        issue.key.clone(),
+                        format_current_jira_message(issue, None),
+                        format!("novy tiket: {}", issue.fields.summary),
+                    ));
+                    changed_count += 1;
+                }
+                Some(old) if old.updated != issue.fields.updated => {
+                    notifications.push((
+                        issue.key.clone(),
+                        format_current_jira_message(issue, Some(old)),
+                        format!("zmena: {}", issue.fields.summary),
+                    ));
+                    changed_count += 1;
+                }
+                Some(_) => {}
             }
+        }
+
+        for (key, old) in &old_state {
+            if new_state.contains_key(key) {
+                continue;
+            }
+
+            let current = fetch_jira_issue_by_key(cfg, jira_http, key)
+                .with_context(|| format!("Nelze overit tiket {key}, ktery zmizel z JQL"))?;
+            notifications.push((
+                key.clone(),
+                format_missing_jira_message(key, old, current.as_ref()),
+                "tiket opustil sledovane JQL".to_string(),
+            ));
+            missing_count += 1;
+        }
+
+        for (key, html, log_text) in &notifications {
+            teams
+                .send_html(html)
+                .with_context(|| format!("Nelze odeslat Teams notifikaci pro {key}"))?;
+            println!("Teams: {key} - {log_text}");
         }
     }
 
-    let new_state: HashMap<String, String> = issues
-        .iter()
-        .map(|issue| (issue.key.clone(), issue.fields.updated.clone()))
-        .collect();
     save_state(&cfg.state_file, &new_state)?;
     *first_run = false;
+
+    println!(
+        "Jira: {} sledovanych, {} zmen, {} opustilo JQL.",
+        issues.len(),
+        changed_count,
+        missing_count
+    );
     Ok(())
 }
 
 fn fetch_jira_issues(cfg: &AppConfig, http: &Client) -> Result<Vec<JiraIssue>> {
     let url = format!("{}/rest/api/3/search/jql", cfg.jira_url);
     let max_results = cfg.max_results.to_string();
+    let mut all_issues = Vec::new();
+    let mut next_page_token: Option<String> = None;
+    let mut seen_tokens = HashSet::new();
+
+    loop {
+        let mut request = http
+            .get(&url)
+            .basic_auth(&cfg.jira_email, Some(&cfg.jira_api_token))
+            .header("Accept", "application/json")
+            .query(&[
+                ("jql", cfg.jql.as_str()),
+                ("maxResults", max_results.as_str()),
+                ("fields", "summary,status,updated,assignee,resolution"),
+            ]);
+
+        if let Some(token) = next_page_token.as_deref() {
+            request = request.query(&[("nextPageToken", token)]);
+        }
+
+        let resp = request.send().context("Jira API request selhal")?;
+        let status = resp.status();
+        let body = resp.text().context("Nelze precist Jira API odpoved")?;
+
+        if !status.is_success() {
+            bail!("Jira API vratilo HTTP {}: {}", status, truncate(&body, 900));
+        }
+
+        let parsed: JiraSearchResponse =
+            serde_json::from_str(&body).context("Jira API nevratilo ocekavany JSON")?;
+
+        let JiraSearchResponse {
+            issues,
+            error_messages,
+            message,
+            is_last,
+            next_page_token: response_next_token,
+        } = parsed;
+
+        let page_issues = if let Some(issues) = issues {
+            issues
+        } else {
+            let detail = if !error_messages.is_empty() {
+                error_messages.join("; ")
+            } else if let Some(message) = message {
+                message
+            } else {
+                truncate(&body, 900)
+            };
+            bail!("Chyba Jira API: {detail}");
+        };
+
+        all_issues.extend(page_issues);
+
+        if is_last == Some(true) {
+            break;
+        }
+
+        let Some(token) = response_next_token.filter(|token| !token.trim().is_empty()) else {
+            break;
+        };
+
+        if !seen_tokens.insert(token.clone()) {
+            bail!("Jira API vratilo opakovany nextPageToken; prerusuji pagination.");
+        }
+        next_page_token = Some(token);
+    }
+
+    Ok(all_issues)
+}
+
+fn fetch_jira_issue_by_key(cfg: &AppConfig, http: &Client, key: &str) -> Result<Option<JiraIssue>> {
+    let url = format!("{}/rest/api/3/issue/{}", cfg.jira_url, encode(key));
     let resp = http
         .get(&url)
         .basic_auth(&cfg.jira_email, Some(&cfg.jira_api_token))
         .header("Accept", "application/json")
-        .query(&[
-            ("jql", cfg.jql.as_str()),
-            ("maxResults", max_results.as_str()),
-            ("fields", "summary,status,updated"),
-        ])
+        .query(&[("fields", "summary,status,updated,assignee,resolution")])
         .send()
-        .context("Jira API request selhal")?;
+        .with_context(|| format!("Jira API detail request pro {key} selhal"))?;
 
     let status = resp.status();
-    let text = resp.text().context("Nelze precist Jira API odpoved")?;
+    let body = resp
+        .text()
+        .with_context(|| format!("Nelze precist Jira API detail odpoved pro {key}"))?;
+
+    if matches!(status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN) {
+        return Ok(None);
+    }
     if !status.is_success() {
-        bail!("Jira API vratilo HTTP {}: {}", status, truncate(&text, 900));
+        bail!(
+            "Jira API detail {} vratil HTTP {}: {}",
+            key,
+            status,
+            truncate(&body, 900)
+        );
     }
 
-    let parsed: JiraSearchResponse =
-        serde_json::from_str(&text).context("Jira API nevratilo ocekavany JSON")?;
-    if let Some(issues) = parsed.issues {
-        return Ok(issues);
-    }
-
-    let detail = if !parsed.error_messages.is_empty() {
-        parsed.error_messages.join("; ")
-    } else if let Some(message) = parsed.message {
-        message
-    } else {
-        truncate(&text, 900)
-    };
-    bail!("Chyba Jira API: {detail}")
+    let issue: JiraIssue = serde_json::from_str(&body)
+        .with_context(|| format!("Jira API detail {key} nevratil ocekavany JSON"))?;
+    Ok(Some(issue))
 }
 
-fn format_jira_message(_cfg: &AppConfig, issue: &JiraIssue) -> String {
+fn jira_issue_state(issue: &JiraIssue) -> JiraIssueState {
+    JiraIssueState {
+        updated: issue.fields.updated.clone(),
+        summary: issue.fields.summary.clone(),
+        status: issue.fields.status.name.clone(),
+        assignee: issue
+            .fields
+            .assignee
+            .as_ref()
+            .map(|assignee| assignee.display_name.clone()),
+        resolution: issue
+            .fields
+            .resolution
+            .as_ref()
+            .map(|resolution| resolution.name.clone()),
+    }
+}
+
+fn format_current_jira_message(issue: &JiraIssue, old: Option<&JiraIssueState>) -> String {
+    let state = jira_issue_state(issue);
     let key = html_escape(&issue.key);
-    let status = html_escape(&issue.fields.status.name);
-    let summary_without_urls = strip_urls(&issue.fields.summary);
-    let summary = html_escape(&summary_without_urls);
-    format!("<b>{key}: {status}</b><br>{summary}")
+    let status = html_escape(&state.status);
+    let summary = safe_summary(&state.summary);
+
+    let title = match old {
+        None => format!("Novy Jira tiket {key}: {status}"),
+        Some(old) if !old.status.is_empty() && old.status != state.status => {
+            format!("{key}: {} -&gt; {status}", html_escape(&old.status))
+        }
+        Some(_) => format!("{key}: {status}"),
+    };
+
+    format!("<b>{title}</b><br>{summary}")
+}
+
+fn format_missing_jira_message(
+    key: &str,
+    old: &JiraIssueState,
+    current: Option<&JiraIssue>,
+) -> String {
+    let escaped_key = html_escape(key);
+
+    let Some(current) = current else {
+        let summary = safe_summary(&old.summary);
+        return format!("<b>{escaped_key}: tiket jiz neni dostupny</b><br>{summary}");
+    };
+
+    let current_state = jira_issue_state(current);
+    let summary = safe_summary(&current_state.summary);
+
+    if current_state.resolution.is_some() && old.resolution.is_none() {
+        let status = html_escape(&current_state.status);
+        let resolution = html_escape(current_state.resolution.as_deref().unwrap_or("vyreseno"));
+        return format!(
+            "<b>{escaped_key}: vyreseno - {status}</b><br>{summary}<br>Resolution: {resolution}"
+        );
+    }
+
+    if old.assignee.is_some() && old.assignee != current_state.assignee {
+        let from = html_escape(old.assignee.as_deref().unwrap_or("bez prirazeni"));
+        let to = html_escape(current_state.assignee.as_deref().unwrap_or("bez prirazeni"));
+        return format!(
+            "<b>{escaped_key}: prirazeni zmeneno</b><br>{summary}<br>{from} -&gt; {to}"
+        );
+    }
+
+    let status = html_escape(&current_state.status);
+    let assignee = html_escape(current_state.assignee.as_deref().unwrap_or("bez prirazeni"));
+    format!(
+        "<b>{escaped_key}: tiket prestal odpovidat JQL</b><br>{summary}<br>Status: {status}<br>Assignee: {assignee}"
+    )
+}
+
+fn safe_summary(summary: &str) -> String {
+    html_escape(&strip_urls(summary))
 }
 
 fn strip_urls(text: &str) -> String {
@@ -1055,29 +1271,40 @@ fn strip_urls(text: &str) -> String {
         .join(" ")
 }
 
-fn load_state(path: &Path) -> Result<HashMap<String, String>> {
+fn load_state(path: &Path) -> Result<HashMap<String, JiraIssueState>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
+
     let text = fs::read_to_string(path)
         .with_context(|| format!("Nelze cist state file {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("State file {} neni platny JSON", path.display()))
+    parse_state(&text).with_context(|| format!("State file {} neni platny JSON", path.display()))
 }
 
-fn save_state(path: &Path, state: &HashMap<String, String>) -> Result<()> {
-    ensure_parent_dir(path)?;
-    let data = serde_json::to_vec_pretty(state).context("Nelze serializovat state")?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp, data).with_context(|| format!("Nelze zapsat {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "Nelze atomicky prejmenovat {} na {}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+fn parse_state(text: &str) -> Result<HashMap<String, JiraIssueState>> {
+    let stored: HashMap<String, StoredIssueState> =
+        serde_json::from_str(text).context("Nelze parsovat state JSON")?;
+
+    Ok(stored
+        .into_iter()
+        .map(|(key, value)| {
+            let state = match value {
+                StoredIssueState::Legacy(updated) => JiraIssueState {
+                    updated,
+                    summary: String::new(),
+                    status: String::new(),
+                    assignee: None,
+                    resolution: None,
+                },
+                StoredIssueState::Rich(state) => state,
+            };
+            (key, state)
+        })
+        .collect())
+}
+
+fn save_state(path: &Path, state: &HashMap<String, JiraIssueState>) -> Result<()> {
+    secure_write_json(path, state).context("Nelze ulozit Jira state")
 }
 
 fn secure_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1339,5 +1566,97 @@ mod tests {
         assert_eq!(truncate("abcdef", 3), "abc...");
         assert_eq!(truncate("a\nb\r", 10), "a b ");
         assert_eq!(truncate("ěščřž", 3), "ěšč...");
+    }
+
+    #[test]
+    fn legacy_state_is_migrated_in_memory() {
+        let state = parse_state(r#"{"K2HW-1":"2026-09-30T15:02:27.712+0200"}"#)
+            .expect("legacy state must parse");
+        let issue = state.get("K2HW-1").expect("issue state");
+        assert_eq!(issue.updated, "2026-09-30T15:02:27.712+0200");
+        assert_eq!(issue.summary, "");
+        assert_eq!(issue.status, "");
+        assert_eq!(issue.assignee, None);
+        assert_eq!(issue.resolution, None);
+    }
+
+    #[test]
+    fn rich_state_roundtrip_preserves_fields() {
+        let mut input = HashMap::new();
+        input.insert(
+            "K2HW-1".to_string(),
+            JiraIssueState {
+                updated: "2026-10-01T08:00:00.000+0200".to_string(),
+                summary: "Test".to_string(),
+                status: "Prirazeno".to_string(),
+                assignee: Some("Petr".to_string()),
+                resolution: None,
+            },
+        );
+
+        let json = serde_json::to_string(&input).expect("serialize");
+        let output = parse_state(&json).expect("rich state must parse");
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn missing_issue_message_detects_resolution() {
+        let old = JiraIssueState {
+            updated: "old".to_string(),
+            summary: "Summary".to_string(),
+            status: "Prirazeno".to_string(),
+            assignee: Some("Petr".to_string()),
+            resolution: None,
+        };
+        let current = JiraIssue {
+            key: "K2HW-1".to_string(),
+            fields: JiraFields {
+                summary: "Summary".to_string(),
+                status: JiraStatus {
+                    name: "Hotovo".to_string(),
+                },
+                updated: "new".to_string(),
+                assignee: Some(JiraAssignee {
+                    display_name: "Petr".to_string(),
+                }),
+                resolution: Some(JiraResolution {
+                    name: "Done".to_string(),
+                }),
+            },
+        };
+
+        let html = format_missing_jira_message("K2HW-1", &old, Some(&current));
+        assert!(html.contains("vyreseno"));
+        assert!(html.contains("Hotovo"));
+        assert!(html.contains("Done"));
+    }
+
+    #[test]
+    fn missing_issue_message_detects_reassignment() {
+        let old = JiraIssueState {
+            updated: "old".to_string(),
+            summary: "Summary".to_string(),
+            status: "Prirazeno".to_string(),
+            assignee: Some("Petr".to_string()),
+            resolution: None,
+        };
+        let current = JiraIssue {
+            key: "K2HW-1".to_string(),
+            fields: JiraFields {
+                summary: "Summary".to_string(),
+                status: JiraStatus {
+                    name: "Prirazeno".to_string(),
+                },
+                updated: "new".to_string(),
+                assignee: Some(JiraAssignee {
+                    display_name: "Eva".to_string(),
+                }),
+                resolution: None,
+            },
+        };
+
+        let html = format_missing_jira_message("K2HW-1", &old, Some(&current));
+        assert!(html.contains("prirazeni zmeneno"));
+        assert!(html.contains("Petr -&gt; Eva"));
     }
 }
