@@ -30,6 +30,7 @@ const TEAMS_OAUTH_RESOURCE: &str = "https://api.spaces.skype.com";
 const TEAMS_SKYPE_SCOPE: &str =
     "service::api.fl.spaces.skype.com::MBI_SSL openid profile offline_access";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const MAX_TEAMS_WEBHOOK_BYTES: usize = 28 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -76,6 +77,43 @@ impl AppConfig {
             state_file,
             max_results,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamsTransport {
+    Consumer,
+    Webhook,
+}
+
+fn parse_teams_transport(value: Option<&str>, webhook_url_present: bool) -> Result<TeamsTransport> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("consumer") => Ok(TeamsTransport::Consumer),
+        Some(value) if value.eq_ignore_ascii_case("webhook") => Ok(TeamsTransport::Webhook),
+        Some(value) => bail!("Invalid TEAMS_TRANSPORT={value:?}. Use consumer or webhook."),
+        None if webhook_url_present => Ok(TeamsTransport::Webhook),
+        None => Ok(TeamsTransport::Consumer),
+    }
+}
+
+fn teams_transport_from_env() -> Result<TeamsTransport> {
+    let configured = optional_nonempty_env("TEAMS_TRANSPORT");
+    let webhook_url_present = optional_nonempty_env("TEAMS_WEBHOOK_URL").is_some();
+    parse_teams_transport(configured.as_deref(), webhook_url_present)
+}
+
+#[derive(Debug, Clone)]
+struct TeamsMessage {
+    html: String,
+    text: String,
+}
+
+impl TeamsMessage {
+    fn new(html: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            html: html.into(),
+            text: text.into(),
+        }
     }
 }
 
@@ -253,6 +291,125 @@ struct ChatSummary {
     one_to_one: bool,
     names: BTreeSet<String>,
     topic: Option<String>,
+}
+
+struct TeamsWebhookClient {
+    http: Client,
+    webhook_url: String,
+}
+
+impl TeamsWebhookClient {
+    fn from_env() -> Result<Self> {
+        let webhook_url = required_env("TEAMS_WEBHOOK_URL")?;
+        if !webhook_url.starts_with("https://") {
+            bail!("TEAMS_WEBHOOK_URL must use https://");
+        }
+
+        let http = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(concat!("jira2teams-rust/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("Cannot create HTTP client for Teams webhook")?;
+
+        Ok(Self { http, webhook_url })
+    }
+
+    fn send_text(&self, text: &str) -> Result<()> {
+        let payload = json!({ "text": text });
+        let serialized =
+            serde_json::to_vec(&payload).context("Cannot serialize Teams webhook payload")?;
+        if serialized.len() > MAX_TEAMS_WEBHOOK_BYTES {
+            bail!(
+                "Teams webhook payload is {} bytes; limit is {} bytes",
+                serialized.len(),
+                MAX_TEAMS_WEBHOOK_BYTES
+            );
+        }
+
+        let mut backoff = 1_u64;
+        for attempt in 1..=4 {
+            let response = self
+                .http
+                .post(&self.webhook_url)
+                .header("Accept", "application/json")
+                .json(&payload)
+                .send();
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = resp
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    let body = resp.text().unwrap_or_default();
+
+                    if status.is_success() {
+                        return Ok(());
+                    }
+
+                    let retryable =
+                        status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                    if retryable && attempt < 4 {
+                        thread::sleep(Duration::from_secs(retry_after.unwrap_or(backoff).max(1)));
+                        backoff = backoff.saturating_mul(2);
+                        continue;
+                    }
+
+                    bail!(
+                        "Teams webhook returned HTTP {}: {}",
+                        status,
+                        truncate(&body, 700)
+                    );
+                }
+                Err(_) if attempt < 4 => {
+                    thread::sleep(Duration::from_secs(backoff));
+                    backoff = backoff.saturating_mul(2);
+                }
+                Err(_) => bail!("Teams webhook HTTP request failed"),
+            }
+        }
+
+        bail!("Teams webhook send failed")
+    }
+}
+
+enum TeamsSender {
+    Consumer(Box<TeamsClient>),
+    Webhook(TeamsWebhookClient),
+}
+
+impl TeamsSender {
+    fn from_env(require_target: bool) -> Result<Self> {
+        match teams_transport_from_env()? {
+            TeamsTransport::Consumer => Ok(Self::Consumer(Box::new(TeamsClient::new(
+                TeamsConfig::from_env(require_target)?,
+            )?))),
+            TeamsTransport::Webhook => Ok(Self::Webhook(TeamsWebhookClient::from_env()?)),
+        }
+    }
+
+    fn ensure_ready(&mut self) -> Result<()> {
+        match self {
+            Self::Consumer(client) => client.ensure_ready(),
+            Self::Webhook(_) => Ok(()),
+        }
+    }
+
+    fn send_message(&mut self, message: &TeamsMessage) -> Result<()> {
+        match self {
+            Self::Consumer(client) => client.send_html(&message.html),
+            Self::Webhook(client) => client.send_text(&message.text),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Consumer(_) => "consumer",
+            Self::Webhook(_) => "webhook",
+        }
+    }
 }
 
 struct TeamsClient {
@@ -919,18 +1076,27 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Mode::Login => {
+            if teams_transport_from_env()? != TeamsTransport::Consumer {
+                bail!("--login is available only with TEAMS_TRANSPORT=consumer");
+            }
             let cfg = TeamsConfig::from_env(false)?;
             let mut teams = TeamsClient::new(cfg)?;
             teams.interactive_login()?;
             return Ok(());
         }
         Mode::Logout => {
+            if teams_transport_from_env()? != TeamsTransport::Consumer {
+                bail!("--logout is available only with TEAMS_TRANSPORT=consumer");
+            }
             let cfg = TeamsConfig::from_env(false)?;
             let mut teams = TeamsClient::new(cfg)?;
             teams.logout()?;
             return Ok(());
         }
         Mode::ListChats => {
+            if teams_transport_from_env()? != TeamsTransport::Consumer {
+                bail!("--list-chats is available only with TEAMS_TRANSPORT=consumer");
+            }
             let cfg = TeamsConfig::from_env(false)?;
             let mut teams = TeamsClient::new(cfg)?;
             let mut chats = teams.list_chats()?;
@@ -956,17 +1122,19 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Mode::TestTeams => {
-            let cfg = TeamsConfig::from_env(true)?;
-            let mut teams = TeamsClient::new(cfg)?;
-            teams.send_html("<b>jira2teams</b><br>Testovaci Teams Personal zprava.")?;
-            println!("Testovaci Teams zprava byla odeslana.");
+            let mut teams = TeamsSender::from_env(true)?;
+            teams.ensure_ready()?;
+            teams.send_message(&TeamsMessage::new(
+                "<b>jira2teams</b><br>Test Teams message.",
+                "jira2teams\nTest Teams message.",
+            ))?;
+            println!("Test Teams message sent via {} transport.", teams.name());
             return Ok(());
         }
         Mode::Watch | Mode::Once => {}
     }
 
     let cfg = AppConfig::from_env()?;
-    let teams_cfg = TeamsConfig::from_env(true)?;
     ensure_parent_dir(&cfg.state_file)?;
     let mut first_run = !cfg.state_file.exists();
     let jira_http = Client::builder()
@@ -974,9 +1142,10 @@ fn main() -> Result<()> {
         .user_agent(concat!("jira2teams-rust/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("Nelze vytvorit HTTP klienta pro Jira")?;
-    let mut teams = TeamsClient::new(teams_cfg)?;
+    let mut teams = TeamsSender::from_env(true)?;
 
     teams.ensure_ready().context("Teams inicializace selhala")?;
+    println!("Teams transport: {}", teams.name());
 
     if mode == Mode::Once {
         check_once(&cfg, &jira_http, &mut teams, &mut first_run)?;
@@ -1001,7 +1170,7 @@ fn main() -> Result<()> {
 fn check_once(
     cfg: &AppConfig,
     jira_http: &Client,
-    teams: &mut TeamsClient,
+    teams: &mut TeamsSender,
     first_run: &mut bool,
 ) -> Result<()> {
     let issues = fetch_jira_issues(cfg, jira_http)?;
@@ -1012,7 +1181,7 @@ fn check_once(
         .map(|issue| (issue.key.clone(), jira_issue_state(issue)))
         .collect();
 
-    let mut notifications: Vec<(String, String, String)> = Vec::new();
+    let mut notifications: Vec<(String, TeamsMessage, String)> = Vec::new();
     let mut changed_count = 0_usize;
     let mut missing_count = 0_usize;
 
@@ -1022,7 +1191,10 @@ fn check_once(
                 None => {
                     notifications.push((
                         issue.key.clone(),
-                        format_current_jira_message(issue, None),
+                        TeamsMessage::new(
+                            format_current_jira_message(issue, None),
+                            format_current_jira_text(cfg, issue, None),
+                        ),
                         format!("novy tiket: {}", issue.fields.summary),
                     ));
                     changed_count += 1;
@@ -1030,7 +1202,10 @@ fn check_once(
                 Some(old) if old.updated != issue.fields.updated => {
                     notifications.push((
                         issue.key.clone(),
-                        format_current_jira_message(issue, Some(old)),
+                        TeamsMessage::new(
+                            format_current_jira_message(issue, Some(old)),
+                            format_current_jira_text(cfg, issue, Some(old)),
+                        ),
                         format!("zmena: {}", issue.fields.summary),
                     ));
                     changed_count += 1;
@@ -1048,15 +1223,18 @@ fn check_once(
                 .with_context(|| format!("Nelze overit tiket {key}, ktery zmizel z JQL"))?;
             notifications.push((
                 key.clone(),
-                format_missing_jira_message(key, old, current.as_ref()),
+                TeamsMessage::new(
+                    format_missing_jira_message(key, old, current.as_ref()),
+                    format_missing_jira_text(cfg, key, old, current.as_ref()),
+                ),
                 "tiket opustil sledovane JQL".to_string(),
             ));
             missing_count += 1;
         }
 
-        for (key, html, log_text) in &notifications {
+        for (key, message, log_text) in &notifications {
             teams
-                .send_html(html)
+                .send_message(message)
                 .with_context(|| format!("Nelze odeslat Teams notifikaci pro {key}"))?;
             println!("Teams: {key} - {log_text}");
         }
@@ -1249,6 +1427,69 @@ fn format_missing_jira_message(
     let assignee = html_escape(current_state.assignee.as_deref().unwrap_or("bez prirazeni"));
     format!(
         "<b>{escaped_key}: tiket prestal odpovidat JQL</b><br>{summary}<br>Status: {status}<br>Assignee: {assignee}"
+    )
+}
+
+fn format_current_jira_text(
+    cfg: &AppConfig,
+    issue: &JiraIssue,
+    old: Option<&JiraIssueState>,
+) -> String {
+    let state = jira_issue_state(issue);
+    let title = match old {
+        None => format!("New Jira issue {}: {}", issue.key, state.status),
+        Some(old) if !old.status.is_empty() && old.status != state.status => {
+            format!("{}: {} -> {}", issue.key, old.status, state.status)
+        }
+        Some(_) => format!("{}: {}", issue.key, state.status),
+    };
+
+    format!(
+        "{title}\n{}\n{}/browse/{}",
+        state.summary, cfg.jira_url, issue.key
+    )
+}
+
+fn format_missing_jira_text(
+    cfg: &AppConfig,
+    key: &str,
+    old: &JiraIssueState,
+    current: Option<&JiraIssue>,
+) -> String {
+    let url = format!("{}/browse/{key}", cfg.jira_url);
+
+    let Some(current) = current else {
+        return format!(
+            "{key}: issue is no longer accessible\n{}\n{url}",
+            old.summary
+        );
+    };
+
+    let current_state = jira_issue_state(current);
+
+    if current_state.resolution.is_some() && old.resolution.is_none() {
+        return format!(
+            "{key}: resolved - {}\n{}\nResolution: {}\n{url}",
+            current_state.status,
+            current_state.summary,
+            current_state.resolution.as_deref().unwrap_or("resolved")
+        );
+    }
+
+    if old.assignee.is_some() && old.assignee != current_state.assignee {
+        return format!(
+            "{key}: assignee changed\n{}\n{} -> {}\n{url}",
+            current_state.summary,
+            old.assignee.as_deref().unwrap_or("unassigned"),
+            current_state.assignee.as_deref().unwrap_or("unassigned")
+        );
+    }
+
+    format!(
+        "{key}: issue left the tracked JQL\n{}\nStatus: {}\nAssignee: {}\n{url}",
+        current_state.summary,
+        current_state.status,
+        current_state.assignee.as_deref().unwrap_or("unassigned")
     )
 }
 
@@ -1463,12 +1704,20 @@ Jira:
   MAX_RESULTS         volitelne; default 50
   STATE_FILE          volitelne; default ~/.cache/jira2teams/state.json
 
-Teams Personal (private/unsupported messaging API, bez Microsoft Graph):
-  TEAMS_THREAD_ID     doporuceno: stabilni ID existujiciho 1:1 chatu
-  TEAMS_TO            alternativa: presne zobrazovane jmeno kontaktu
-  TEAMS_AUTH_FILE     volitelne; default ~/.config/jira2teams/teams-auth.json
+Teams transport:
+  TEAMS_TRANSPORT     consumer or webhook; default consumer
+  TEAMS_WEBHOOK_URL   Teams Workflow callback URL; setting it without
+                      TEAMS_TRANSPORT automatically selects webhook
+  TEAMS_THREAD_ID     consumer: stable existing 1:1 chat ID
+  TEAMS_TO            consumer: alternative exact display name
+  TEAMS_AUTH_FILE     consumer: default ~/.config/jira2teams/teams-auth.json
 
-Prihlaseni:
+Webhook:
+  Uses the Teams Workflow trigger "When a Teams webhook request is received".
+  v0.5 supports trigger authentication set to "Anyone".
+  Jira2Teams sends no Authorization header and treats the callback URL as secret.
+
+Consumer login:
   Heslo se do aplikace nezadava ani neuklada.
   Jednou spust jira2teams --login a dokonci Microsoft device-code login v prohlizeci.
   Refresh token se ulozi s pravy 0600 a prezije restart aplikace i pocitace.
@@ -1482,12 +1731,18 @@ Volitelne override endpointu:
   TEAMS_AUTH_URL
   TEAMS_CHAT_URL
 
-Doporuceny postup:
-  1. jira2teams --login
-  2. jira2teams --list-chats
-  3. nastav TEAMS_THREAD_ID
-  4. jira2teams --test-teams
-  5. spust jako systemd --user sluzbu
+Recommended webhook setup:
+  1. create a Teams Workflow webhook with authentication "Anyone"
+  2. set TEAMS_TRANSPORT=webhook and TEAMS_WEBHOOK_URL
+  3. jira2teams --test-teams
+  4. run the systemd --user service
+
+Consumer fallback:
+  1. set TEAMS_TRANSPORT=consumer
+  2. jira2teams --login
+  3. jira2teams --list-chats
+  4. set TEAMS_THREAD_ID
+  5. jira2teams --test-teams
 "#
     );
 }
@@ -1495,6 +1750,35 @@ Doporuceny postup:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teams_transport_defaults_to_consumer() {
+        assert_eq!(
+            parse_teams_transport(None, false).expect("default transport"),
+            TeamsTransport::Consumer
+        );
+    }
+
+    #[test]
+    fn teams_transport_infers_webhook_from_url() {
+        assert_eq!(
+            parse_teams_transport(None, true).expect("webhook inference"),
+            TeamsTransport::Webhook
+        );
+    }
+
+    #[test]
+    fn teams_transport_honors_explicit_consumer() {
+        assert_eq!(
+            parse_teams_transport(Some("consumer"), true).expect("explicit consumer"),
+            TeamsTransport::Consumer
+        );
+    }
+
+    #[test]
+    fn teams_transport_rejects_unknown_value() {
+        assert!(parse_teams_transport(Some("graph"), false).is_err());
+    }
 
     #[test]
     fn device_code_accepts_numeric_timing_fields() {

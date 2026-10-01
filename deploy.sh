@@ -17,6 +17,24 @@ version() {
   sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1
 }
 
+env_file_value() {
+  local key="$1" file="$2" value
+  [ -f "$file" ] || return 0
+  value="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$file" | tail -n 1)"
+  value="${value%$'\r'}"
+  case "$value" in
+    \"*\")
+      value="${value#\"}"
+      value="${value%\"}"
+      ;;
+    \'*\')
+      value="${value#\'}"
+      value="${value%\'}"
+      ;;
+  esac
+  printf '%s' "$value"
+}
+
 build() {
   rustup target add "$TARGET" >/dev/null
   cargo build --manifest-path "$ROOT/Cargo.toml" --release
@@ -51,19 +69,36 @@ install_user() {
     install -m 600 "$ROOT/jira2teams.env.example" "$ENV_FILE"
     echo
     echo "Vytvoren config template: $ENV_FILE"
-    echo "Dopln JIRA_API_TOKEN, JIRA_URL/JIRA_EMAIL a TEAMS_THREAD_ID."
-    echo "Pak spust: $USER_BIN --login"
-    echo "A nakonec: systemctl --user enable --now jira2teams.service"
+    echo "Dopln Jira konfiguraci a vyber Teams transport."
+    echo "Webhook: nastav TEAMS_TRANSPORT=webhook a TEAMS_WEBHOOK_URL."
+    echo "Consumer: nastav TEAMS_TRANSPORT=consumer a TEAMS_THREAD_ID, potom spust $USER_BIN --login."
+    echo "Nakonec: systemctl --user enable --now jira2teams.service"
     systemctl --user daemon-reload
     exit 2
   fi
 
-  if [ ! -f "$AUTH_FILE" ]; then
-    echo
-    echo "Chybi Teams auth cache: $AUTH_FILE"
-    echo "Spust jednou: $USER_BIN --login"
-    echo "Pak: systemctl --user enable --now jira2teams.service"
-    systemctl --user daemon-reload
+  local teams_transport webhook_url
+  teams_transport="$(env_file_value TEAMS_TRANSPORT "$ENV_FILE")"
+  webhook_url="$(env_file_value TEAMS_WEBHOOK_URL "$ENV_FILE")"
+
+  if [ "$teams_transport" = "webhook" ] || { [ -z "$teams_transport" ] && [ -n "$webhook_url" ]; }; then
+    echo "Teams transport: webhook"
+    if [ -z "$webhook_url" ]; then
+      echo "Chybi TEAMS_WEBHOOK_URL v $ENV_FILE" >&2
+      exit 2
+    fi
+  elif [ -z "$teams_transport" ] || [ "$teams_transport" = "consumer" ]; then
+    echo "Teams transport: consumer"
+    if [ ! -f "$AUTH_FILE" ]; then
+      echo
+      echo "Chybi Teams auth cache: $AUTH_FILE"
+      echo "Spust jednou: $USER_BIN --login"
+      echo "Pak: systemctl --user enable --now jira2teams.service"
+      systemctl --user daemon-reload
+      exit 2
+    fi
+  else
+    echo "Neplatny TEAMS_TRANSPORT=$teams_transport v $ENV_FILE" >&2
     exit 2
   fi
 
@@ -97,14 +132,18 @@ package_deb() {
   out="$ROOT/dist/jira2teams_${ver}_${arch}.deb"
 
   rm -rf "$stage"
-  install -d "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/user" "$stage/usr/share/doc/jira2teams/examples" "$stage/usr/share/doc/jira2teams"
+  install -d "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/user" "$stage/usr/share/doc/jira2teams/examples" "$stage/usr/share/doc/jira2teams/docs" "$stage/usr/share/doc/jira2teams"
   install -m 755 "$BIN" "$stage/usr/bin/jira2teams"
   install -m 644 "$ROOT/debian/jira2teams.service" "$stage/usr/lib/systemd/user/jira2teams.service"
   install -m 644 "$ROOT/jira2teams.env.example" "$stage/usr/share/doc/jira2teams/examples/jira2teams.env.example"
   install -m 644 "$ROOT/README.md" "$stage/usr/share/doc/jira2teams/README.md"
+  install -m 644 "$ROOT/SECURITY.md" "$stage/usr/share/doc/jira2teams/SECURITY.md"
+  install -m 644 "$ROOT/CHANGELOG.md" "$stage/usr/share/doc/jira2teams/CHANGELOG.md"
   install -m 644 "$ROOT/debian/README.Debian" "$stage/usr/share/doc/jira2teams/README.Debian"
-  [ -f "$ROOT/docs/DEPLOYMENT.md" ] && install -m 644 "$ROOT/docs/DEPLOYMENT.md" "$stage/usr/share/doc/jira2teams/DEPLOYMENT.md"
-  [ -f "$ROOT/docs/TROUBLESHOOTING.md" ] && install -m 644 "$ROOT/docs/TROUBLESHOOTING.md" "$stage/usr/share/doc/jira2teams/TROUBLESHOOTING.md"
+  for doc in "$ROOT"/docs/*.md; do
+    [ -f "$doc" ] || continue
+    install -m 644 "$doc" "$stage/usr/share/doc/jira2teams/docs/$(basename "$doc")"
+  done
 
   cat > "$stage/DEBIAN/control" <<CONTROL
 Package: jira2teams
@@ -113,9 +152,9 @@ Section: net
 Priority: optional
 Architecture: $arch
 Maintainer: ${DEB_MAINTAINER:-Jira2Teams Project <jira2teams@localhost>}
-Description: Jira Cloud watcher sending changes to a Teams Personal 1:1 chat
- Static musl Rust binary. Uses Jira REST API and the Teams Personal consumer
- chat backend. Microsoft Graph is not used for message delivery.
+Description: Jira Cloud watcher sending changes to Microsoft Teams
+ Static musl Rust binary. Uses Jira REST API and supports Microsoft Teams
+ Workflows webhooks plus a legacy Teams Personal consumer transport.
 CONTROL
 
   dpkg-deb --root-owner-group --build "$stage" "$out"

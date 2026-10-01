@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 - 2026-10-01
+
+- add a transport abstraction for Teams message delivery,
+- add Microsoft Teams Workflows webhook transport,
+- keep the existing Teams Personal consumer backend as an explicit legacy/experimental fallback,
+- infer webhook mode when `TEAMS_WEBHOOK_URL` is configured and no transport is explicitly selected,
+- keep `consumer` as the compatibility default when no webhook is configured,
+- send simple JSON `{ "text": ... }` payloads to Teams Workflows,
+- add retry/backoff handling for webhook HTTP 429 and 5xx responses,
+- enforce the documented 28 KB webhook payload limit,
+- keep webhook URLs out of error messages and document them as secrets,
+- include Jira URLs in webhook notifications while continuing to strip URLs for the consumer transport,
+- add transport-selection regression tests,
+- document Workflows setup and the v0.5 unauthenticated trigger scope.
+- add GitHub Actions CI for pushes and automatic Debian release publishing for version tags.
+- refuse tagged releases whose commit is not already contained in `main`.
+
 ## 0.4.0 - 2026-10-01
 
 - paginate Jira enhanced JQL search with `nextPageToken` before comparing state,

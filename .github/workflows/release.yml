@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential musl-tools musl-dev pkg-config dpkg-dev ca-certificates
+
+      - name: Verify release tag and Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          TAG="${GITHUB_REF_NAME}"
+          [ "$TAG" = "v$VERSION" ] || { echo "Tag $TAG does not match Cargo.toml version $VERSION" >&2; exit 1; }
+          [ "$(git cat-file -t "$TAG")" = "tag" ] || { echo "Release tag $TAG must be an annotated tag" >&2; exit 1; }
+          printf 'VERSION=%s\n' "$VERSION" >> "$GITHUB_ENV"
+
+      - name: Verify tagged commit is on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "Tagged commit $GITHUB_SHA is not contained in origin/main" >&2
+            exit 1
+          }
+
+      - name: Run full validation
+        run: bash scripts/validate.sh
+
+      - name: Generate checksum and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEB="jira2teams_${VERSION}_amd64.deb"
+          cd dist
+          [ -f "$DEB" ] || { echo "Missing dist/$DEB" >&2; exit 1; }
+          sha256sum "$DEB" > "$DEB.sha256"
+          cd ..
+          awk -v version="$VERSION" '
+            $0 ~ "^## " version " " { found=1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > dist/release-notes.md
+          [ -s dist/release-notes.md ] || { echo "Release notes for $VERSION not found in CHANGELOG.md" >&2; exit 1; }
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          DEB="dist/jira2teams_${VERSION}_amd64.deb"
+          SHA="${DEB}.sha256"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "Jira2Teams $TAG" --notes-file dist/release-notes.md
+            gh release upload "$TAG" "$DEB" "$SHA" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$DEB" "$SHA" --repo "$GITHUB_REPOSITORY" --title "Jira2Teams $TAG" --notes-file dist/release-notes.md --verify-tag
+          fi
+
+      - name: Upload release build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jira2teams-release-${{ github.ref_name }}
+          path: |
+            dist/jira2teams_*_amd64.deb
+            dist/jira2teams_*_amd64.deb.sha256
+          if-no-files-found: error
+          retention-days: 30

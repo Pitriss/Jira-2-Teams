@@ -13,27 +13,60 @@ The project started as a replacement for a Bash watcher built around `curl`, `jq
 - detection of issues that leave the tracked JQL result
 - classification of resolved and reassigned issues when Jira detail remains accessible
 - automatic migration of the legacy v0.3.x state format
-- Microsoft Teams Personal one-to-one notifications
-- device-code login with a persisted refresh-token cache
+- Microsoft Teams Workflows webhook notifications
+- legacy Microsoft Teams Personal consumer transport for compatibility
+- device-code login with a persisted refresh-token cache for the consumer transport
 - `systemd --user` deployment
 - static `x86_64-unknown-linux-musl` build
 - Debian 13/amd64 package generation
 - unit tests, diagnostics, and end-to-end test tooling
 
-## Current Teams transport
+## Teams transports
 
-The current Teams Personal transport does **not** use Microsoft Graph for message delivery. It uses Microsoft's consumer chat backend.
+Jira2Teams v0.5.0 supports two message transports.
 
-This backend is not a public or stable API. Microsoft can change or restrict it without notice. Accounts can also be placed into anti-abuse or quarantine states. One observed restriction is:
+### `webhook` - recommended
+
+The recommended transport sends an HTTPS POST to a Microsoft Teams Workflow created with the **When a Teams webhook request is received** trigger.
+
+```text
+TEAMS_TRANSPORT=webhook
+TEAMS_WEBHOOK_URL=<Teams Workflow callback URL>
+```
+
+If `TEAMS_WEBHOOK_URL` is set and `TEAMS_TRANSPORT` is omitted, Jira2Teams automatically selects the webhook transport.
+
+The webhook receives:
+
+```json
+{
+  "text": "Jira notification text"
+}
+```
+
+The v0.5.0 implementation is intended for a Workflow trigger whose authentication setting is **Anyone**. Jira2Teams deliberately sends no `Authorization` header in this mode. Treat `TEAMS_WEBHOOK_URL` as a credential and keep the environment file at mode `0600`.
+
+The webhook transport does not initialize the Teams Personal consumer OAuth/Skype-token flow.
+
+### `consumer` - legacy/experimental fallback
+
+```text
+TEAMS_TRANSPORT=consumer
+TEAMS_THREAD_ID=19:...@thread.v2
+```
+
+This backend uses Microsoft's undocumented Teams Personal consumer chat service. It is not a stable public API and can be restricted by Microsoft anti-abuse systems.
+
+One observed restriction was:
 
 ```text
 QuarantineURLsBlocked
 URLs are not allowed in messages in quarantine mode
 ```
 
-Jira2Teams therefore strips URLs from notification text before sending through the consumer transport.
+For this transport Jira2Teams strips URLs from notification content before sending.
 
-For production environments, read [docs/TEAMS-CONSUMER-RISK.md](docs/TEAMS-CONSUMER-RISK.md). A supported Teams Workflows webhook transport is the preferred future direction.
+See [docs/TEAMS-CONSUMER-RISK.md](docs/TEAMS-CONSUMER-RISK.md).
 
 ## Data flow
 
@@ -48,9 +81,12 @@ jira2teams
     v
 state.json
     |
-    | Teams Personal consumer chat transport
-    v
-1:1 Teams chat
+    | selected Teams transport
+    +----------------------+----------------------+
+    |                                             |
+    v                                             v
+Teams Workflow webhook                  Teams Personal consumer API
+(recommended)                           (legacy/experimental)
 ```
 
 ## Jira state model
@@ -116,7 +152,23 @@ ldd target/x86_64-unknown-linux-musl/release/jira2teams
 
 Expected output includes `static-pie linked` / `statically linked`.
 
-## First Teams login
+## Teams Workflow webhook setup
+
+Create a workflow in Microsoft Teams or Power Automate with the **When a Teams webhook request is received** trigger.
+
+For Jira2Teams v0.5.0:
+
+1. configure the trigger authentication setting as **Anyone**,
+2. add an action that posts the incoming `text` value to the required Teams chat or channel,
+3. save the workflow and copy its callback URL,
+4. store the URL in `TEAMS_WEBHOOK_URL`,
+5. test with `jira2teams --test-teams`.
+
+Microsoft documents that Workflows can post to a Teams chat or channel. Workflow ownership is user-based, so production workflows should have an appropriate co-owner to avoid becoming orphaned.
+
+## Consumer transport login
+
+This section applies only to `TEAMS_TRANSPORT=consumer`.
 
 Run:
 
@@ -124,7 +176,7 @@ Run:
 ./target/x86_64-unknown-linux-musl/release/jira2teams --login
 ```
 
-Jira2Teams displays the Microsoft device-code login URL and code. After successful login, the refresh-token cache is stored in:
+After successful device-code login, the refresh-token cache is stored in:
 
 ```text
 ~/.config/jira2teams/teams-auth.json
@@ -132,9 +184,7 @@ Jira2Teams displays the Microsoft device-code login URL and code. After successf
 
 The file should have mode `0600`.
 
-The cached login normally survives both application and host restarts. If Microsoft revokes the refresh token, run `--login` again.
-
-List available chats:
+List available consumer chats:
 
 ```bash
 ./target/x86_64-unknown-linux-musl/release/jira2teams --list-chats
@@ -159,6 +209,15 @@ JIRA_API_TOKEN=...
 JQL=assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC
 POLL_INTERVAL=60
 MAX_RESULTS=50
+
+TEAMS_TRANSPORT=webhook
+TEAMS_WEBHOOK_URL=<Teams Workflow callback URL>
+```
+
+Consumer fallback:
+
+```text
+TEAMS_TRANSPORT=consumer
 TEAMS_THREAD_ID=19:...@thread.v2
 ```
 
@@ -171,10 +230,10 @@ TEAMS_AUTH_FILE=~/.config/jira2teams/teams-auth.json
 
 ## One-shot tests
 
-Send a direct Teams test message:
+Send a Teams test message using the configured transport:
 
 ```bash
-TEAMS_THREAD_ID='19:...@thread.v2' ./target/x86_64-unknown-linux-musl/release/jira2teams --test-teams
+./target/x86_64-unknown-linux-musl/release/jira2teams --test-teams
 ```
 
 Run one Jira poll:
@@ -287,6 +346,19 @@ bash scripts/validate.sh
 The validation checks formatting, unit tests, Clippy with warnings denied, static musl build, Debian package generation, package contents, and Git whitespace.
 
 See [docs/TESTING.md](docs/TESTING.md).
+
+
+## Continuous integration and releases
+
+GitHub Actions is the authoritative build path for published release artifacts.
+
+- pushes to `main` and `feature/**` run the full validation suite,
+- version tags `v*` rebuild and validate the project from the tagged commit,
+- the tag version must match `Cargo.toml`,
+- the release workflow creates the Debian package and SHA-256 checksum,
+- GitHub Release assets are uploaded by the workflow itself.
+
+Local `./deploy.sh package-deb` remains available for development and pre-push testing, but locally built packages are not used as official release assets.
 
 ## Security
 

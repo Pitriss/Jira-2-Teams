@@ -29,7 +29,10 @@ Regression tests cover behavior that has caused real integration failures or car
 - migration of the v0.3.x Jira state format,
 - rich-state round trips,
 - resolved-ticket classification,
-- reassignment classification.
+- reassignment classification,
+- Teams transport default and inference behavior,
+- explicit consumer selection when a webhook URL is also present,
+- rejection of unsupported transport names.
 
 ## Integration diagnostics
 

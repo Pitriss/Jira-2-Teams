@@ -1,6 +1,6 @@
 [package]
 name = "jira2teams"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Jira watcher that sends one-to-one Microsoft Teams Personal messages"
 

@@ -25,6 +25,14 @@ Recommended local permissions:
 
 The Debian package intentionally contains no account configuration, tokens, or Jira state.
 
+## Teams Workflow webhook URL
+
+`TEAMS_WEBHOOK_URL` is a credential when the Workflow trigger is configured with authentication **Anyone**. Anyone who obtains the callback URL can invoke that workflow.
+
+Keep the URL only in the mode `0600` environment file. Do not print it in logs, diagnostics, issue reports, shell history, or committed configuration.
+
+Jira2Teams v0.5.0 deliberately does not send an `Authorization` header in this mode.
+
 ## Unsupported Teams consumer API
 
 The Teams Personal consumer transport is not a public stable API. Treat endpoint failures and account restrictions as integration failures.

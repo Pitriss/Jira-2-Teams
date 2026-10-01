@@ -74,7 +74,7 @@ Documentation:
 
 https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook
 
-This is the preferred direction for a future Jira2Teams transport:
+This transport is implemented in Jira2Teams v0.5.0 and is the preferred production direction:
 
 ```text
 Jira Cloud
@@ -90,7 +90,9 @@ Teams Workflow webhook
 Teams chat or channel
 ```
 
-This removes the need for Jira2Teams to hold a consumer Teams refresh token or call the private consumer chat backend.
+When `TEAMS_TRANSPORT=webhook` is selected, Jira2Teams does not initialize the consumer Teams OAuth/Skype-token flow. This removes the need for Jira2Teams to hold a Teams Personal refresh token or call the private consumer chat backend.
+
+The v0.5.0 webhook implementation targets a Teams Workflow trigger configured with authentication **Anyone**. The callback URL must be treated as a secret. Tenant-authenticated Workflow triggers require an OAuth token and are outside the v0.5.0 scope.
 
 Another supported architecture is a Teams bot/agent with proactive messaging. Microsoft documents proactive one-to-one messages when the app is installed in personal scope:
 

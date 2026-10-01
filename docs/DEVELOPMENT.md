@@ -82,3 +82,11 @@ The repository must not contain:
 The current Teams Personal consumer transport is reverse engineered and unsupported. Keep it isolated from Jira/state logic so a supported transport can be added without rewriting the watcher.
 
 See `docs/TEAMS-CONSUMER-RISK.md`.
+
+## GitHub Actions CI
+
+Every push to `main` and `feature/**`, every pull request targeting `main`, and manual workflow dispatch run `.github/workflows/ci.yml`.
+
+CI runs the same `scripts/validate.sh` used locally. The Debian package produced by CI is uploaded only as a short-lived workflow artifact for inspection; it is not a release artifact.
+
+The release workflow is intentionally separate from CI. Release assets are built again from the exact tagged commit.

@@ -1,5 +1,27 @@
 # Troubleshooting
 
+## Teams Workflow webhook returns HTTP 401/403
+
+Jira2Teams v0.5.0 expects the **When a Teams webhook request is received** trigger authentication setting to be **Anyone**.
+
+If the Workflow is configured for **Any user in my tenant** or **Specific users in my tenant**, Microsoft requires an OAuth token in the request. That authenticated trigger mode is not implemented in v0.5.0.
+
+Either use the supported v0.5.0 `Anyone` configuration with a secret callback URL, or keep using the consumer transport until OAuth-authenticated Workflow support is implemented.
+
+## Teams Workflow webhook returns HTTP 429 or 5xx
+
+The webhook transport retries HTTP 429 and server errors with a short exponential backoff. Persistent failures are returned to the watcher and the Jira state is not advanced, allowing the notification to be retried on a later poll.
+
+## `--login` or `--list-chats` fails in webhook mode
+
+These commands are consumer-specific. Set:
+
+```text
+TEAMS_TRANSPORT=consumer
+```
+
+before using consumer login/chat discovery.
+
 ## `Bearer token missing`
 
 Direct Teams Personal username/password authentication is not supported by Jira2Teams.

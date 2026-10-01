@@ -49,6 +49,21 @@ Recommended permissions:
 ~/.cache/jira2teams/state.json        0600
 ```
 
+## Recommended Teams Workflow configuration
+
+For production use, prefer:
+
+```text
+TEAMS_TRANSPORT=webhook
+TEAMS_WEBHOOK_URL=<Teams Workflow callback URL>
+```
+
+The v0.5.0 client expects a **When a Teams webhook request is received** trigger configured with authentication **Anyone**. The workflow should map the incoming `text` property to a Teams post action.
+
+Treat the callback URL as a secret and keep the environment file at mode `0600`.
+
+The Workflow is owned by user accounts rather than by a team/channel object. Assign an appropriate co-owner for operational continuity.
+
 ## Debian package
 
 Build:
@@ -94,3 +109,35 @@ systemctl --user restart jira2teams.service
 ```
 
 The state format from v0.3.x is migrated automatically by v0.4.0.
+
+## GitHub release pipeline
+
+Official release packages are built by GitHub Actions from annotated version tags. Local `.deb` builds are development artifacts only.
+
+Release flow:
+
+```text
+validated main
+    |
+    | annotated tag vX.Y.Z
+    v
+GitHub Actions release workflow
+    |
+    +-- verify tag matches Cargo.toml version
+    +-- run the full validation suite
+    +-- build the static musl binary
+    +-- build the Debian amd64 package
+    +-- generate SHA-256
+    +-- publish GitHub Release assets
+```
+
+Create and push a release tag only after the corresponding commit is on `main`:
+
+```bash
+git switch main
+git pull --ff-only
+git tag -a vX.Y.Z -m "Jira2Teams vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The release workflow uses the repository-scoped GitHub Actions token with only `contents: write` permission. No personal access token is required for release publishing.
